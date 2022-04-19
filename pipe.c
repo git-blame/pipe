@@ -960,11 +960,14 @@ static inline snapshot_t pop_without_locking(snapshot_t s,
     assertume(s.begin != s.bufend);
 
     size_t elem_size = s.elem_size;
+    // from begin to bufend could just be the sentinel (or part of one)
+    size_t remaining = s.bufend - s.begin;
 
     // Copy either as many bytes as requested, or the available bytes in the RHS
     // of a wrapped buffer - whichever is smaller.
+    if(likely(remaining > elem_size))
     {
-        size_t first_bytes_to_copy = min(bytes_to_copy, (size_t)(s.bufend - s.begin - elem_size));
+        size_t first_bytes_to_copy = min(bytes_to_copy, (size_t)(remaining - elem_size));
 
         target = offset_memcpy(target, s.begin + elem_size, first_bytes_to_copy);
 

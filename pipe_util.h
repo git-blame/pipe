@@ -35,6 +35,20 @@ extern "C" {
 #define MUST_SENTINEL
 #endif
 
+#ifdef _WIN32 // use the native win32 API on Windows
+
+#include <windows.h>
+
+#define THREAD_HANDLE HANDLE
+
+#else // fall back on pthreads
+
+#include <pthread.h>
+
+#define THREAD_HANDLE pthread_t
+
+#endif
+
 /*
  * A function that can be used for processing a pipe.
  *
@@ -69,7 +83,13 @@ pipeline_t pipe_trivial_pipeline(pipe_t* p);
  */
 void pipe_connect(pipe_consumer_t* in,
                   pipe_processor_t proc, void* aux,
-                  pipe_producer_t* out);
+                  pipe_producer_t* out,
+                  THREAD_HANDLE*   handle);
+
+/*
+ * Free up any resources created by pipe_connect
+ */
+void pipe_connect_free(THREAD_HANDLE handle);
 
 /*
  * Creates a pipeline with multiple instances of the same function working on
@@ -83,6 +103,7 @@ void pipe_connect(pipe_consumer_t* in,
  * your auxilary data to ensure there are no double-free bugs.
  */
 pipeline_t pipe_parallel(size_t           instances,
+                         THREAD_HANDLE**  handles,
                          size_t           in_size,
                          pipe_processor_t proc,
                          void*            aux,
@@ -123,7 +144,12 @@ pipeline_t pipe_parallel(size_t           instances,
  *  [int] and returns the last type [awesome] (or NULL if the last vararg was a
  *  function).
  */
-pipeline_t MUST_SENTINEL pipe_pipeline(size_t first_size, ...);
+pipeline_t MUST_SENTINEL pipe_pipeline(int* count, THREAD_HANDLE** handles, size_t first_size, ...);
+
+/*
+ * Free up any resources created by pipe_parallel or pipe_pipeline
+ */
+void pipe_handles_free(int count, THREAD_HANDLE** handles);
 
 #undef MUST_SENTINEL
 

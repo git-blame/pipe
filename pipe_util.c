@@ -26,27 +26,39 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32 // use the native win32 API on Windows
 
 #include <windows.h>
 
-#define thread_create(f, p) CloseHandle(            \
+#define thread_create(f, p) \
         CreateThread(NULL,                          \
                      0,                             \
                      (LPTHREAD_START_ROUTINE)(f),   \
                      (p),                           \
                      0,                             \
-                     NULL))
+                     NULL)
+
+static inline void thread_destroy(THREAD_HANDLE t)
+{
+    CloseHandle(t);
+}
 
 #else // fall back on pthreads
 
 #include <pthread.h>
 
-static inline void thread_create(void *(*f) (void*), void* p)
+static inline THREAD_HANDLE thread_create(void *(*f) (void*), void* p)
 {
     pthread_t t;
     pthread_create(&t, NULL, f, p);
+    return t;
+}
+
+static inline void thread_destroy(THREAD_HANDLE t)
+{
+    pthread_join(t, NULL);
 }
 
 #endif
@@ -92,7 +104,8 @@ static void* process_pipe(void* param)
 
 void pipe_connect(pipe_consumer_t* in,
                   pipe_processor_t proc, void* aux,
-                  pipe_producer_t* out)
+                  pipe_producer_t* out,
+                  THREAD_HANDLE*   handle)
 {
     assert(in);
     assert(out);
@@ -107,10 +120,19 @@ void pipe_connect(pipe_consumer_t* in,
         .out = out
     };
 
-    thread_create(&process_pipe, d);
+    THREAD_HANDLE t = thread_create(&process_pipe, d);
+    if(handle != NULL)
+      *handle = t;
+}
+
+void pipe_connect_free(THREAD_HANDLE handle)
+{
+    if (handle)
+      thread_destroy(handle);
 }
 
 pipeline_t pipe_parallel(size_t           instances,
+                         THREAD_HANDLE**  handles,
                          size_t           in_size,
                          pipe_processor_t proc,
                          void*            aux,
@@ -119,10 +141,17 @@ pipeline_t pipe_parallel(size_t           instances,
     pipe_t* in  = pipe_new(in_size,  0),
           * out = pipe_new(out_size, 0);
 
+    THREAD_HANDLE* threads = malloc(instances * sizeof(*threads));
+    int   count   = 0;
+
     while(instances--)
+    {
+        THREAD_HANDLE thread  = (THREAD_HANDLE)NULL;
         pipe_connect(pipe_consumer_new(in),
                      proc, aux,
-                     pipe_producer_new(out));
+                     pipe_producer_new(out), &thread);
+        memcpy((char *)threads+(count++ * sizeof(thread)), &thread, sizeof(thread));
+    }
 
     pipeline_t ret = {
         .in  = pipe_producer_new(in),
@@ -132,10 +161,16 @@ pipeline_t pipe_parallel(size_t           instances,
     pipe_free(in);
     pipe_free(out);
 
+    if(handles != NULL)
+        *handles = threads;
+    else
+        free(threads);
     return ret;
 }
 
-static pipeline_t va_pipe_pipeline(pipeline_t result_so_far,
+static pipeline_t va_pipe_pipeline(int* count,
+                                   THREAD_HANDLE** handles,
+                                   pipeline_t result_so_far,
                                    va_list args)
 {
     pipe_processor_t proc = va_arg(args, pipe_processor_t);
@@ -155,22 +190,35 @@ static pipeline_t va_pipe_pipeline(pipeline_t result_so_far,
 
     pipe_t* pipe = pipe_new(pipe_size, 0);
 
-    pipe_connect(result_so_far.out , proc, aux, pipe_producer_new(pipe));
+    THREAD_HANDLE handle = (THREAD_HANDLE)NULL;
+    pipe_connect(result_so_far.out , proc, aux, pipe_producer_new(pipe), &handle);
+    if(count != NULL && handles != NULL)
+    {
+        int new_count = *count + 1;
+        int new_size = new_count * sizeof(*handles);
+        THREAD_HANDLE* new_handles = realloc(*handles, new_size);
+        if(new_handles != NULL)
+        {
+            memcpy((char *)new_handles+(*count * sizeof(handle)), &handle, sizeof(handle));
+            *count = new_count;
+            *handles = new_handles;
+        }
+    }
     result_so_far.out = pipe_consumer_new(pipe);
 
     pipe_free(pipe);
 
-    return va_pipe_pipeline(result_so_far, args);
+    return va_pipe_pipeline(count, handles, result_so_far, args);
 }
 
-pipeline_t pipe_pipeline(size_t first_size, ...)
+pipeline_t pipe_pipeline(int* count, THREAD_HANDLE** handles, size_t first_size, ...)
 {
     va_list va;
     va_start(va, first_size);
 
     pipe_t* p = pipe_new(first_size, 0);
 
-    pipeline_t ret = va_pipe_pipeline(pipe_trivial_pipeline(p), va);
+    pipeline_t ret = va_pipe_pipeline(count, handles, pipe_trivial_pipeline(p), va);
 
     pipe_free(p);
 
@@ -179,5 +227,19 @@ pipeline_t pipe_pipeline(size_t first_size, ...)
     return ret;
 }
 
+void pipe_handles_free(int count, THREAD_HANDLE** handles)
+{
+    if(!count || !handles)
+        return;
+    THREAD_HANDLE* t = *handles;
+    for(int i = 0; i < count; i++)
+    {
+        THREAD_HANDLE handle;
+        memcpy(&handle, (char *)t+(i * sizeof(handle)), sizeof(handle));
+        pipe_connect_free(handle);
+    }
+    free(*handles);
+    *handles = NULL;
+}
 
 /* vim: set et ts=4 sw=4 softtabstop=4 textwidth=80: */

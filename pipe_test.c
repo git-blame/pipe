@@ -22,6 +22,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#define _DEFAULT_SOURCE
 #include "pipe.h"
 #include "pipe_util.h"
 
@@ -153,8 +154,10 @@ static void validate_consumer(pipe_consumer_t* c, unsigned doublings)
 
 DEF_TEST(pipeline_multiplier)
 {
+    int count = 0;
+    THREAD_HANDLE* handles = NULL;
     pipeline_t pipeline =
-        pipe_pipeline(sizeof(testdata_t),
+        pipe_pipeline(&count, &handles, sizeof(testdata_t),
                       &double_elems, (void*)NULL, sizeof(testdata_t),
                       &double_elems, (void*)NULL, sizeof(testdata_t),
                       &double_elems, (void*)NULL, sizeof(testdata_t),
@@ -171,12 +174,15 @@ DEF_TEST(pipeline_multiplier)
 
     generate_test_data(pipeline.in); pipe_producer_free(pipeline.in);
     validate_consumer(pipeline.out, 8);  pipe_consumer_free(pipeline.out);
+    pipe_handles_free(count, &handles);
 }
 
 DEF_TEST(parallel_multiplier)
 {
+    THREAD_HANDLE* handles = NULL;
     pipeline_t pipeline =
         pipe_parallel(4,
+                      &handles,
                       sizeof(testdata_t),
                       &double_elems, (void*)NULL,
                       sizeof(testdata_t));
@@ -186,6 +192,7 @@ DEF_TEST(parallel_multiplier)
 
     generate_test_data(pipeline.in); pipe_producer_free(pipeline.in);
     validate_consumer(pipeline.out, 1); pipe_consumer_free(pipeline.out);
+    pipe_handles_free(4, &handles);
 }
 
 struct Foo
@@ -242,7 +249,7 @@ DEF_TEST(issue_5)
 
   int buf[NUM];
   size_t ret = pipe_pop(c, buf, NUM);
-  assert(ret == NUM);
+  assert(ret == (size_t)NUM);
   for(int i=0; i < NUM; ++i)
     assert(buf[i] == data[i]);
 
@@ -266,7 +273,7 @@ DEF_TEST(issue_6_a)
 
   int buf[NUM];
   size_t ret = pipe_pop(c, buf, NUM);
-  assert(ret == NUM);
+  assert(ret == (size_t)NUM);
   for(int i=0; i < NUM; ++i)
     assert(buf[i] == data[i]);
 
@@ -291,7 +298,7 @@ DEF_TEST(issue_6_b)
 
   int buf[NUM];
   size_t ret = pipe_pop(c, buf, NUM);
-  assert(ret == NUM);
+  assert(ret == (size_t)NUM);
   for(int i=0; i < NUM; ++i)
     assert(buf[i] == data[i]);
 
@@ -302,28 +309,40 @@ DEF_TEST(issue_6_b)
 
 #include <windows.h>
 
-#define thread_create(f, p) CloseHandle(            \
+#define TEST_THREAD_HANDLE HANDLE
+
+#define thread_create(f, p) \
         CreateThread(NULL,                          \
                      0,                             \
                      (LPTHREAD_START_ROUTINE)(f),   \
                      (p),                           \
                      0,                             \
-                     NULL))
+                     NULL)
 
-#define thread_sleep(s) Sleep((s) * 1000)
+#define thread_destroy(h) CloseHandle(h)
+
+#define thread_sleep(s) Sleep(s)
 
 #else // fall back on pthreads
 
 #include <pthread.h>
 #include <unistd.h>
 
-static inline void thread_create(void *(*f) (void*), void* p)
+#define TEST_THREAD_HANDLE pthread_t
+
+static inline TEST_THREAD_HANDLE thread_create(void *(*f) (void*), void* p)
 {
     pthread_t t;
     pthread_create(&t, NULL, f, p);
+    return t;
 }
 
-#define thread_sleep(s) sleep(s)
+static inline void thread_destroy(TEST_THREAD_HANDLE t)
+{
+    pthread_join(t, NULL);
+}
+
+#define thread_sleep(s) usleep((s) * 1000)
 
 #endif
 
@@ -340,11 +359,11 @@ static void* process_pipe_issue_6_c(void* param)
 
   //printf("Consumer waiting for a bit ...\n");
   //printf("Consumer starts to read pipe ...\n");
-  thread_sleep(1);
+  thread_sleep(1000);
   assert(v->writing); // producer still writing, blocked from finishing
   int buf[NUM];
   size_t ret = pipe_pop(v->c, buf, NUM);
-  assert(ret == NUM);
+  assert(ret == (size_t)NUM);
   for(int i=0; i < NUM; ++i)
     assert(buf[i] == i);
 
@@ -369,7 +388,7 @@ DEF_TEST(issue_6_c)
 
   pipe_free(pipe);
 
-  thread_create(&process_pipe_issue_6_c, params);
+  TEST_THREAD_HANDLE t = thread_create(&process_pipe_issue_6_c, params);
 
   int data[NUM];
   for(int i=0; i < NUM; ++i)
@@ -381,11 +400,77 @@ DEF_TEST(issue_6_c)
   pipe_push(p, data, NUM);
   //printf("Producer unblocked ...\n");
   params->writing = 0;
-  thread_sleep(1);
+  thread_sleep(1000);
   assert(params->read == NUM);
 
+  thread_destroy(t);
   free(params);
   pipe_producer_free(p);
+}
+
+#define DATASZ FILENAME_MAX
+#define TEXT "ThisIsATestOfTheEmergencyBroadcastSystem"
+
+static void* process_pipe_issue_12(void* param)
+{
+  issue_6_t v = *(issue_6_t *)param;
+  char buf[FILENAME_MAX];
+  free(param);
+
+  v.read = 0;
+  size_t ret = 0;
+  do
+  {
+    memset(buf, 0, sizeof(buf));
+    ret = pipe_pop(v.c, buf, 1);
+    if(ret == 0) break;
+    assert(ret == (size_t)1);
+    //printf("read: %s [%d]\n", buf, v.writing);
+    assert(strcmp(buf, TEXT) == 0);
+    v.read++;
+  } while (1);
+  //printf("[%d] Read %d values ...\n", v.writing, v.read);
+  pipe_consumer_free(v.c);
+  return NULL;
+}
+
+// consumer may fail if consumers read faster than producer can write
+DEF_TEST(issue_12)
+{
+  static const int NUM = 16;
+  static const int COUNT = 4;
+  int val = 0;
+  char data[DATASZ] = { 0 };
+  TEST_THREAD_HANDLE handles[COUNT];
+
+  pipe_t* pipe = pipe_new(DATASZ, NUM);
+  pipe_reserve(PIPE_GENERIC(pipe), NUM);
+
+  memcpy(data, TEXT, sizeof(TEXT));
+
+  pipe_producer_t* p = pipe_producer_new(pipe);
+  for(int i=0; i < COUNT; i++)
+  {
+    issue_6_t* params = malloc(sizeof(*params));
+    memset(params, 0, sizeof(*params));
+    params->c = pipe_consumer_new(pipe);
+    params->writing = i;
+    handles[i] = thread_create(&process_pipe_issue_12, params);
+  }
+
+  pipe_free(pipe);
+  int ITERATION = COUNT * 3000;
+  for(int i=0; i < ITERATION; i++)
+  {
+    pipe_push(p, data, 1);
+    val++;
+  }
+  pipe_producer_free(p);
+
+  for(int i=0; i < COUNT; i++)
+    thread_destroy(handles[i]);
+
+  //printf("Wrote %d values ...\n", val);
 }
 
 /*
@@ -453,6 +538,7 @@ void pipe_run_test_suite(void)
     RUN_TEST(issue_6_a);
     RUN_TEST(issue_6_b);
     RUN_TEST(issue_6_c);
+    RUN_TEST(issue_12);
 /*
 #ifdef PIPE_DEBUG
     RUN_TEST(clobbering);
